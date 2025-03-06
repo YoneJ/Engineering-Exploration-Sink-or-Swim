@@ -1,0 +1,247 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+
+#define LORA_FREQUENCY 433E6
+#define SECURITY_PHRASE "MinhBeo"
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define ss 15        // LoRa Chip Select
+#define rst 5        // LoRa Reset
+#define dio0 27      // LoRa IRQ
+// Define HSPI pins
+#define HSPI_SCK 14  // HSPI Clock
+#define HSPI_MISO 12 // HSPI MISO
+#define HSPI_MOSI 13 // HSPI MOSI
+
+// Define motor control pins
+int M1_Left = 32;
+int M1_Right = 33;
+int M2_Left = 26;
+int M2_Right = 25;
+
+// Define pump control pins
+#define pumpInPin 18
+#define pumpOutPin 19
+
+// LoRa setup
+SPIClass hspi(HSPI);
+TwoWire I2CBNO = TwoWire(0);
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x29, &I2CBNO);
+
+const unsigned long MOTOR_RUN_LIMIT = 10000; // 10 seconds max motor runtime
+unsigned long motorStartTime = 0;
+bool isMotorRunning = false;
+
+TaskHandle_t loRaTaskHandle;  // Handle for the LoRa task
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize SPI and LoRa
+  hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, ss);
+  LoRa.setPins(ss, rst, dio0);
+  LoRa.setSPI(hspi);
+  if (!LoRa.begin(LORA_FREQUENCY)) {
+    Serial.println("LoRa initialization failed!");
+    while (true);
+  }
+  Serial.println("LoRa initialized");
+  
+  xTaskCreatePinnedToCore(
+    loRaTask,        // Task function
+    "LoRaTask",      // Task name
+    4096,            // Stack size in bytes
+    NULL,            // Task parameters
+    1,               // Priority
+    &loRaTaskHandle, // Task handle
+    0                // Core 0
+  );
+  
+  // Initialize BNO055
+  //I2CBNO.begin(I2C_SDA, I2C_SCL);
+  //if (!bno.begin()) {
+  //  Serial.println("BNO055 initialization failed!");
+  //  while (true);
+  //}
+  //Serial.println("BNO055 initialized");
+
+  // Configure motor and pump pins
+  pinMode(M1_Left, OUTPUT);
+  pinMode(M1_Right, OUTPUT);
+  pinMode(M2_Left, OUTPUT);
+  pinMode(M2_Right, OUTPUT);
+  pinMode(pumpInPin, OUTPUT);
+  pinMode(pumpOutPin, OUTPUT);
+}
+
+void loop() {
+  // Check motor runtime
+  if (isMotorRunning && (millis() - motorStartTime >= MOTOR_RUN_LIMIT)) {
+    handleStop();
+    isMotorRunning = false;
+    //Serial.println("Motor stopped after running for 10 seconds");
+    //LoRa.end();
+    //LoRa.begin(LORA_FREQUENCY);
+    //LoRa.receive(); 
+  }
+
+  delay(10); // Small delay for stability
+}
+
+void loRaTask(void *pvParameters) {
+  while (true) {
+    // Reset LoRa module
+    handleStopM();
+    resetLoRaModule();
+    // Wait for 2 seconds before the next reset
+    delay(3000);
+  }
+}
+
+void resetLoRaModule() {
+  LoRa.end();
+  LoRa.begin(LORA_FREQUENCY);
+  LoRa.onReceive(onReceive);
+  LoRa.receive(); 
+  Serial.println("LoRa module reset");
+}
+
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;
+
+  char receivedText[128] = {0};
+  int index = 0;
+
+  while (LoRa.available() && index < sizeof(receivedText) - 1) {
+    receivedText[index++] = (char)LoRa.read();
+  }
+  receivedText[index] = '\0';
+
+  Serial.print("Received: ");
+  Serial.println(receivedText);
+
+  // Verify the command with the security phrase
+  if (strncmp(receivedText, SECURITY_PHRASE, strlen(SECURITY_PHRASE)) == 0) {
+    String actualCommand = String(receivedText + strlen(SECURITY_PHRASE));
+    handleCommand(actualCommand);
+  } else {
+    Serial.println("Invalid or unauthorized command received");
+  }
+}
+
+void handleCommand(String command) {
+  Serial.print("Executing command: ");
+  Serial.println(command);
+
+  if (command == "FORWARD") {
+    handleForward();
+  } else if (command == "BACKWARD") {
+    handleBackward();
+  } else if (command == "TURN_RIGHT") {
+    handleTurnRight();
+  } else if (command == "TURN_LEFT") {
+    handleTurnLeft();
+  } else if (command == "PUMP_IN") {
+    handlePumpIn();
+  } else if (command == "PUMP_OUT") {
+    handlePumpOut();
+  } else if (command == "STOP") {
+    handleStop();
+  } else {
+    Serial.println("Unknown command received");
+  }
+}
+
+void moveMotor1(int direction, int speed = 255) {
+  boolean inPin1 = LOW;
+  boolean inPin2 = HIGH;
+
+  if (direction == 1) {
+    inPin1 = HIGH;
+    inPin2 = LOW;
+  }
+  analogWrite(M1_Left, inPin1 ? speed : 0);
+  analogWrite(M1_Right, inPin2 ? speed : 0);
+}
+
+void moveMotor2(int direction, int speed = 255) {
+  boolean inPin1 = LOW;
+  boolean inPin2 = HIGH;
+
+  if (direction == 1) {
+    inPin1 = HIGH;
+    inPin2 = LOW;
+  }
+  analogWrite(M2_Left, inPin1 ? speed : 0);
+  analogWrite(M2_Right, inPin2 ? speed : 0);
+}
+
+void stopMotor1() {
+  analogWrite(M1_Left, 0);
+  analogWrite(M1_Right, 0);
+}
+
+void stopMotor2() {
+  analogWrite(M2_Left, 0);
+  analogWrite(M2_Right, 0);
+}
+
+void handleForward() {
+  moveMotor1(1);
+  moveMotor2(1);
+  motorStartTime = millis();
+  isMotorRunning = true;
+  ///LoRa.end();
+  //LoRa.begin(LORA_FREQUENCY);
+  //LoRa.receive(); 
+  Serial.println("Moving forward");
+}
+
+void handleBackward() {
+  moveMotor1(2);
+  moveMotor2(2);
+  motorStartTime = millis();
+  isMotorRunning = true;
+  Serial.println("Moving backward");
+}
+
+void handleTurnRight() {
+  moveMotor1(2);
+  moveMotor2(1);
+  Serial.println("Turning right");
+}
+
+void handleTurnLeft() {
+  moveMotor1(1);
+  moveMotor2(2);
+  Serial.println("Turning left");
+}
+
+void handlePumpIn() {
+  digitalWrite(pumpInPin, HIGH);
+  digitalWrite(pumpOutPin, LOW);
+  Serial.println("Pumping in");
+}
+
+void handlePumpOut() {
+  digitalWrite(pumpInPin, LOW);
+  digitalWrite(pumpOutPin, HIGH);
+  Serial.println("Pumping out");
+}
+
+void handleStopM() {
+  stopMotor1();
+  stopMotor2();
+  //Serial.println("All systems stopped");
+}
+
+void handleStop() {
+  handleStopM();
+  digitalWrite(pumpInPin, LOW);
+  digitalWrite(pumpOutPin, LOW);
+  Serial.println("All systems stopped");
+}
